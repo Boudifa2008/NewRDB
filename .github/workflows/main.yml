@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: "Select Workspace Operation"
+        description: "Select operation"
         required: true
         type: choice
         default: full
@@ -21,13 +21,12 @@ on:
         type: string
 
       artifact_name:
-        description: "Backup artifact name"
+        description: "Exact backup artifact name"
         required: false
-        default: windows-backup
         type: string
 
       enable_tailscale:
-        description: "Enable Tailscale"
+        description: "Enable private Tailscale network"
         required: false
         default: false
         type: boolean
@@ -42,39 +41,48 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
 
-    env:
-      WORKSPACE_DIR: ${{ runner.temp }}/WindowsWorkspace
-
     steps:
 
+      # 1. Download repository
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # 2. Initialize workspace
       - name: Initialize Workspace
         shell: pwsh
         run: |
-          New-Item -ItemType Directory `
-            -Force -Path $env:WORKSPACE_DIR
+          $workspace = Join-Path $env:RUNNER_TEMP "WindowsWorkspace"
 
-          if (Test-Path "$env:GITHUB_WORKSPACE/workspace") {
-            Copy-Item `
-              "$env:GITHUB_WORKSPACE/workspace/*" `
-              $env:WORKSPACE_DIR `
-              -Recurse -Force
+          New-Item -ItemType Directory -Force `
+            -Path $workspace | Out-Null
+
+          $source = Join-Path $env:GITHUB_WORKSPACE "workspace"
+
+          if (Test-Path $source) {
+            Get-ChildItem $source -Force |
+              Copy-Item -Destination $workspace `
+                -Recurse -Force
           }
 
           Write-Host "Workspace initialized."
 
+      # 3. Validate restore
       - name: Validate Restore
-        if: ${{ inputs.operation == 'restore' }}
+        if: ${{ inputs.operation == 'restore' || (inputs.operation == 'full' && inputs.restore_run_id != '') }}
         shell: pwsh
         env:
           RESTORE_RUN_ID: ${{ inputs.restore_run_id }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:RESTORE_RUN_ID)) {
             throw "Previous Run ID is required."
           }
 
+          if ([string]::IsNullOrWhiteSpace($env:ARTIFACT_NAME)) {
+            throw "Artifact name is required."
+          }
+
+      # 4. Restore backup
       - name: Restore Previous Backup
         if: ${{ inputs.operation == 'restore' || (inputs.operation == 'full' && inputs.restore_run_id != '') }}
         uses: actions/download-artifact@v4
@@ -85,6 +93,7 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.restore_run_id }}
 
+      # 5. Install applications
       - name: Install Applications
         if: ${{ inputs.operation == 'setup' || inputs.operation == 'full' }}
         shell: pwsh
@@ -101,7 +110,7 @@ jobs:
           $failed = @()
 
           foreach ($app in $apps) {
-            Write-Host "Installing: $app"
+            Write-Host "Installing $app"
 
             winget install `
               --id $app `
@@ -112,18 +121,19 @@ jobs:
               --disable-interactivity
 
             if ($LASTEXITCODE -ne 0) {
-              Write-Warning "Installation failed: $app"
               $failed += $app
+              Write-Warning "Failed: $app"
             }
           }
 
           if ($failed.Count -gt 0) {
-            Write-Warning "Some applications failed:"
+            Write-Warning "Some applications failed."
             $failed | ForEach-Object {
               Write-Warning $_
             }
           }
 
+      # 6. Configure Tailscale
       - name: Configure Tailscale
         if: ${{ inputs.enable_tailscale }}
         shell: pwsh
@@ -135,7 +145,7 @@ jobs:
           }
 
           $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          $msi = "$env:TEMP\tailscale.msi"
+          $msi = Join-Path $env:TEMP "tailscale.msi"
 
           Invoke-WebRequest -Uri $url -OutFile $msi
 
@@ -168,6 +178,7 @@ jobs:
 
           & $exe ip -4
 
+      # 7. Windows diagnostics
       - name: Windows Diagnostics
         shell: pwsh
         run: |
@@ -188,10 +199,19 @@ jobs:
 
           Get-PSDrive -PSProvider FileSystem
 
+          Write-Host "Installed Tools"
+
+          git --version
+
+          python --version
+
+      # 8. Prepare backup
       - name: Prepare Backup
         if: ${{ inputs.operation != 'setup' }}
         shell: pwsh
         run: |
+          $workspace = Join-Path $env:RUNNER_TEMP "WindowsWorkspace"
+
           $info = @"
           Windows Workspace Backup
           Date: $(Get-Date -Format o)
@@ -201,19 +221,21 @@ jobs:
           "@
 
           $info | Out-File `
-            "$env:WORKSPACE_DIR\backup-info.txt"
+            (Join-Path $workspace "backup-info.txt")
 
           Write-Host "Backup prepared."
 
+      # 9. Upload backup
       - name: Save Workspace Backup
         if: ${{ inputs.operation != 'setup' }}
         uses: actions/upload-artifact@v4
         with:
-          name: windows-backup
+          name: windows-backup-${{ github.run_id }}
           path: ${{ runner.temp }}/WindowsWorkspace/
           retention-days: 30
           if-no-files-found: error
 
+      # 10. Final report
       - name: Generate Report
         if: always()
         shell: pwsh
@@ -223,11 +245,11 @@ jobs:
           @"
           # Windows Workspace Report
 
-          - Repository: $env:GITHUB_REPOSITORY
-          - Run ID: $env:GITHUB_RUN_ID
-          - Operation: ${{ inputs.operation }}
-          - Result: $env:JOB_STATUS
-          - Date: $(Get-Date -Format o)
-
-          Windows Workspace completed.
+          Repository: $env:GITHUB_REPOSITORY
+          Run ID: $env:GITHUB_RUN_ID
+          Operation: ${{ inputs.operation }}
+          Result: $env:JOB_STATUS
+          Date: $(Get-Date -Format o)
           "@ | Out-File $env:GITHUB_STEP_SUMMARY
+
+          Write-Host "Workspace workflow finished."
