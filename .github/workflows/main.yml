@@ -1,0 +1,894 @@
+name: Windows VPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      restart_count:
+        description: "Internal counter (leave as is)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: write
+  actions: write
+  checks: read
+
+env:
+  TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_PAT: ${{ secrets.GH_PAT }}
+  RESTART_COUNT: ${{ inputs.restart_count || '0' }}
+  MAX_RESTARTS: "3"
+
+jobs:
+  vps:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Restore files
+        uses: actions/checkout@v4
+
+      - name: Telegram helper
+        shell: pwsh
+        run: |
+          $end = (Get-Date).ToUniversalTime().AddMinutes(345).ToString("o")
+          $start = (Get-Date).ToUniversalTime().ToString("o")
+          "END_TIME=$end" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "START_TIME=$start" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          @'
+          # ============ Telegram helper ============
+          $SettingsMap = @(
+            @{ n = 'vscode-settings.json';    p = 'C:\Users\RDP\AppData\Roaming\Code\User\settings.json' },
+            @{ n = 'vscode-keybindings.json'; p = 'C:\Users\RDP\AppData\Roaming\Code\User\keybindings.json' },
+            @{ n = 'rstudio-prefs.json';      p = 'C:\Users\RDP\AppData\Roaming\RStudio\rstudio-prefs.json' },
+            @{ n = 'chrome-bookmarks.json';   p = 'C:\Users\RDP\AppData\Local\Google\Chrome\User Data\Default\Bookmarks' },
+            @{ n = 'terminal-settings.json';  p = 'C:\Users\RDP\AppData\Local\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json' }
+          )
+          $CodeCli = 'C:\Program Files\Microsoft VS Code\bin\code.cmd'
+          $CodeExtDir = 'C:\Users\RDP\.vscode\extensions'
+
+          $helpText = @(
+            '🟢 السيرفر خدّام. الأوامر:',
+            '/info - IP واسم المستخدم وكلمة السر',
+            '/status - حالة السيرفر',
+            '/time - الوقت لي باقي',
+            '/speed - قياس سرعة السيرفر (فيه زر)',
+            '/menu - لوحة أزرار سريعة',
+            '/errors - آخر الأخطاء لي صرات',
+            '/setkey tskey-... - تبديل مفتاح Tailscale',
+            '/save - حفظ الملفات في GitHub الآن',
+            '/backup - نسخة zip من MY WORK تجيك في تلجرام',
+            '/files - قائمة الملفات | /files اسم - يبعثلك ملف ولا مجلد',
+            '/screenshot - صورة لشاشة السيرفر',
+            '/run أمر - ينفّذ أمر PowerShell ويبعثلك النتيجة',
+            '/install اسم - تثبيت تطبيق بـ choco',
+            '/newpass - كلمة سر جديدة | /newpass auto 3 (كل 3 ساعات) | /newpass auto off',
+            '/idle off - /idle 120 - /idle on : الإغلاق عند عدم الاتصال',
+            '/watch اسم - /unwatch اسم : مراقبة برنامج',
+            '/restart - تشغيل سيرفر جديد',
+            '/stop - إيقاف التشغيل التلقائي',
+            '/off - حفظ وإغلاق هذا السيرفر الآن'
+          ) -join "`n"
+
+          function Send-TG($text) {
+            try {
+              if ($text.Length -gt 4000) { $text = $text.Substring(0, 4000) + "…" }
+              Invoke-RestMethod -Uri "https://api.telegram.org/bot$($env:TG_BOT_TOKEN)/sendMessage" -Method Post -Body @{ chat_id = $env:TG_CHAT_ID; text = $text } | Out-Null
+            } catch { Write-Host "Telegram error" }
+          }
+
+          $global:ErrLog = @()
+          $global:ErrSeen = @{}
+
+          function Report-Error($where, $err) {
+            $msg = "$($err.Exception.Message)".Trim()
+            if ($env:TG_BOT_TOKEN) { $msg = $msg.Replace($env:TG_BOT_TOKEN, '***') }
+            $global:ErrLog += "[$(Get-Date -Format 'HH:mm')] ${where}: $msg"
+            if ($global:ErrLog.Count -gt 20) { $global:ErrLog = $global:ErrLog[-20..-1] }
+            $key = "$where|$msg"
+            if (-not $global:ErrSeen.ContainsKey($key) -or ((Get-Date) - $global:ErrSeen[$key]).TotalMinutes -ge 30) {
+              $global:ErrSeen[$key] = Get-Date
+              Send-TG "⚠️ خطأ في ${where}:`n$msg"
+            }
+          }
+
+          function Send-TGFile($path, $caption) {
+            try {
+              $item = Get-Item -LiteralPath $path -ErrorAction Stop
+              if ($item.Length -gt 49MB) {
+                Send-TG "⚠️ الملف كبير بزاف ($([math]::Round($item.Length / 1MB)) MB). تلجرام يقبل حتى 50MB فقط."
+                return $false
+              }
+              Invoke-RestMethod -Uri "https://api.telegram.org/bot$($env:TG_BOT_TOKEN)/sendDocument" -Method Post -Form @{ chat_id = $env:TG_CHAT_ID; caption = $caption; document = $item } | Out-Null
+              return $true
+            } catch { Send-TG "❌ فشل إرسال الملف"; return $false }
+          }
+
+          function Send-TGPhoto($path, $caption) {
+            try {
+              $item = Get-Item -LiteralPath $path -ErrorAction Stop
+              Invoke-RestMethod -Uri "https://api.telegram.org/bot$($env:TG_BOT_TOKEN)/sendPhoto" -Method Post -Form @{ chat_id = $env:TG_CHAT_ID; caption = $caption; photo = $item } | Out-Null
+            } catch { [void](Send-TGFile $path $caption) }
+          }
+
+          function Send-TGButtons($text, $rows) {
+            $kbRows = New-Object System.Collections.ArrayList
+            foreach ($row in $rows) {
+              $btns = New-Object System.Collections.ArrayList
+              foreach ($item in ($row -split '\|')) {
+                $p = $item -split ';', 2
+                [void]$btns.Add(@{ text = $p[0]; callback_data = $p[1] })
+              }
+              [void]$kbRows.Add($btns)
+            }
+            $markup = @{ inline_keyboard = $kbRows } | ConvertTo-Json -Depth 6 -Compress
+            try {
+              Invoke-RestMethod -Uri "https://api.telegram.org/bot$($env:TG_BOT_TOKEN)/sendMessage" -Method Post -Body @{ chat_id = $env:TG_CHAT_ID; text = $text; reply_markup = $markup } | Out-Null
+            } catch { Write-Host "Telegram error" }
+          }
+
+          function Answer-Callback($id) {
+            try { Invoke-RestMethod -Uri "https://api.telegram.org/bot$($env:TG_BOT_TOKEN)/answerCallbackQuery" -Method Post -Body @{ callback_query_id = $id } | Out-Null } catch { }
+          }
+
+          function Measure-Ms([scriptblock]$sb) {
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            try { & $sb | Out-Null; return [int]$sw.ElapsedMilliseconds } catch { return -1 }
+          }
+
+          function Get-AvgMs([scriptblock]$sb, $n = 3) {
+            $vals = @()
+            for ($i = 0; $i -lt $n; $i++) { $v = Measure-Ms $sb; if ($v -ge 0) { $vals += $v } }
+            if ($vals.Count -eq 0) { return -1 }
+            return [int](($vals | Measure-Object -Average).Average)
+          }
+
+          function Fmt-Ms($v) { if ($v -lt 0) { "غير متاح" } else { "$v ms" } }
+
+          function Send-Speed {
+            $tgMs = Get-AvgMs { Invoke-RestMethod -Uri "https://api.telegram.org/bot$($env:TG_BOT_TOKEN)/getMe" -TimeoutSec 10 }
+            $ghMs = Get-AvgMs { Invoke-WebRequest -Uri "https://github.com" -Method Head -TimeoutSec 10 -UseBasicParsing }
+            $ggMs = Get-AvgMs { Invoke-WebRequest -Uri "https://www.google.com" -Method Head -TimeoutSec 10 -UseBasicParsing }
+            $down = "غير متاح"; $up = "غير متاح"; $downVal = 0
+            try {
+              $size = 20000000
+              $sw = [Diagnostics.Stopwatch]::StartNew()
+              $null = Invoke-WebRequest -Uri "https://speed.cloudflare.com/__down?bytes=$size" -TimeoutSec 40 -UseBasicParsing
+              $sw.Stop()
+              $downVal = [math]::Round($size * 8 / 1e6 / $sw.Elapsed.TotalSeconds)
+              $down = "$downVal Mbps"
+            } catch { }
+            try {
+              $buf = New-Object byte[] 8000000
+              $sw = [Diagnostics.Stopwatch]::StartNew()
+              $null = Invoke-WebRequest -Uri "https://speed.cloudflare.com/__up" -Method Post -Body $buf -ContentType "application/octet-stream" -TimeoutSec 40 -UseBasicParsing
+              $sw.Stop()
+              $up = "$([math]::Round(8000000 * 8 / 1e6 / $sw.Elapsed.TotalSeconds)) Mbps"
+            } catch { }
+            $verdict = if ($downVal -ge 100 -and $tgMs -ge 0 -and $tgMs -lt 300) { "ممتازة" }
+              elseif ($downVal -ge 30) { "مليحة" }
+              elseif ($downVal -gt 0) { "ضعيفة" }
+              else { "ما تقاسش" }
+            Send-TGButtons ("⚡ سرعة السيرفر`nTelegram: $(Fmt-Ms $tgMs)`nGitHub: $(Fmt-Ms $ghMs)`nGoogle: $(Fmt-Ms $ggMs)`nتحميل (Download): $down`nرفع (Upload): $up`nالنتيجة: $verdict") @("🔁 أعد القياس;speed|📊 الحالة;status")
+          }
+
+          function Invoke-Timed([scriptblock]$sb, [object[]]$ArgList = @(), $sec = 60) {
+            $j = Start-Job -ScriptBlock $sb -ArgumentList $ArgList
+            if (Wait-Job $j -Timeout $sec) { $out = Receive-Job $j } else { Stop-Job $j; $out = "(timeout)" }
+            Remove-Job $j -Force -ErrorAction SilentlyContinue
+            return $out
+          }
+
+          function Add-Stat($k, $v) { Add-Content -Path "C:\stats.txt" -Value "$k,$v" }
+
+          function Get-LeftMin {
+            $end = [datetime]::Parse($env:END_TIME, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+            [math]::Max(0, [int](($end - (Get-Date).ToUniversalTime()).TotalMinutes))
+          }
+
+          function Get-Rdp {
+            try { return [bool]((quser 2>$null) -match 'rdp-tcp#') } catch { return $false }
+          }
+
+          function Get-Info {
+            "🖥️ معلومات الدخول`nIP: $env:TS_IP`nUser: RDP`nPass: $env:RDP_PASS`n⏳ باقي: $(Get-LeftMin) دقيقة"
+          }
+
+          function Get-Status {
+            $cpu = [int](Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average
+            $os = Get-CimInstance Win32_OperatingSystem
+            $ram = [int](100 * (1 - $os.FreePhysicalMemory / $os.TotalVisibleMemorySize))
+            $free = [math]::Round((Get-PSDrive C).Free / 1GB, 1)
+            $rdp = if (Get-Rdp) { "متصل" } else { "ما كاينش حد" }
+            $tsip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null | Select-Object -First 1
+            $tsok = if ($tsip) { "شغّال" } else { "مقطوع ⚠️" }
+            "📊 حالة السيرفر`nCPU: $cpu%`nRAM: $ram%`nالقرص C: فارغ $free GB`nTailscale: $tsok`nRDP: $rdp`n⏳ باقي: $(Get-LeftMin) دقيقة"
+          }
+
+          function Invoke-InSession([string]$code) {
+            $f = 'C:\Users\Public\insession.ps1'
+            Set-Content -Path $f -Value $code -Encoding utf8
+            $tr = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ' + $f
+            & schtasks.exe /create /tn VPSSession /tr $tr /sc once /st 00:00 /ru RDP /rp $env:RDP_PASS /it /rl highest /f 2>&1 | Out-Null
+            & schtasks.exe /run /tn VPSSession 2>&1 | Out-Null
+          }
+
+          function New-RdpPassword {
+            $chars = (48..57) + (65..90) + (97..122)
+            $np = (-join ((1..16 | ForEach-Object { [char]($chars | Get-Random) }))) + "!aA1"
+            Write-Host "::add-mask::$np"
+            Set-LocalUser -Name "RDP" -Password (ConvertTo-SecureString $np -AsPlainText -Force)
+            $env:RDP_PASS = $np
+            return $np
+          }
+
+          function Start-NewRun($count) {
+            try {
+              $wf = [IO.Path]::GetFileName(($env:GITHUB_WORKFLOW_REF -split '@')[0])
+              $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+              $body = @{ ref = $env:GITHUB_REF_NAME; inputs = @{ restart_count = "$count" } } | ConvertTo-Json -Depth 5
+              Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)/actions/workflows/$wf/dispatches" -Headers $headers -Body $body -ContentType "application/json" | Out-Null
+              return $true
+            } catch {
+              Send-TG "❌ فشل التشغيل التلقائي: $($_.Exception.Message)"
+              return $false
+            }
+          }
+
+          function Backup-Settings($full) {
+            if (-not (Test-Path 'C:\Users\RDP\AppData')) { return }
+            $dir = Join-Path $env:GITHUB_WORKSPACE '.vps-settings'
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            foreach ($m in $SettingsMap) {
+              if (Test-Path -LiteralPath $m.p) { Copy-Item -LiteralPath $m.p -Destination (Join-Path $dir $m.n) -Force -ErrorAction SilentlyContinue }
+            }
+            $global:ExtTick = [int]$global:ExtTick + 1
+            if ((Test-Path $CodeCli) -and (Test-Path $CodeExtDir) -and ($full -or ($global:ExtTick % 6 -eq 1))) {
+              $exts = Invoke-Timed { param($c, $d) & $c --list-extensions --extensions-dir $d 2>$null } @($CodeCli, $CodeExtDir) 60
+              $exts = @($exts | Where-Object { $_ -match '^[A-Za-z0-9_.-]+$' })
+              if ($exts.Count -gt 0) { $exts | Set-Content (Join-Path $dir 'vscode-extensions.txt') }
+            }
+          }
+
+          function Restore-Settings {
+            $dir = Join-Path $env:GITHUB_WORKSPACE '.vps-settings'
+            if (-not (Test-Path $dir)) { return }
+            $n = 0
+            foreach ($m in $SettingsMap) {
+              $src = Join-Path $dir $m.n
+              if ((Test-Path $src) -and -not (Test-Path -LiteralPath $m.p)) {
+                New-Item -ItemType Directory -Force -Path (Split-Path $m.p) | Out-Null
+                Copy-Item -LiteralPath $src -Destination $m.p -Force
+                $n++
+              }
+            }
+            $extFile = Join-Path $dir 'vscode-extensions.txt'
+            if ((Test-Path $extFile) -and (Test-Path $CodeCli)) {
+              $exts = @(Get-Content $extFile)
+              Invoke-Timed { param($c, $d, $list) foreach ($e in $list) { & $c --install-extension $e --extensions-dir $d --force 2>&1 | Out-Null } } @($CodeCli, $CodeExtDir, $exts) 300 | Out-Null
+              $n += $exts.Count
+            }
+            if ($n -gt 0) { Send-TG "⚙️ رجّعت إعدادات التطبيقات (VS Code, RStudio, Chrome, Terminal) و$($exts.Count) إضافة." }
+          }
+
+          function Update-LastFiles {
+            $ws = $env:GITHUB_WORKSPACE
+            $dir = Join-Path $ws '.vps-settings'
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            $files = Get-ChildItem -Path $ws -Recurse -File -Force -ErrorAction SilentlyContinue |
+              Where-Object { ($_.Extension -in @('.R', '.Rmd', '.qmd', '.py', '.ipynb')) -and $_.FullName -notlike '*\.git\*' -and $_.FullName -notlike '*\.vps-settings\*' } |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 3
+            if ($files) { $files | ForEach-Object { $_.FullName.Substring($ws.Length + 1) } | Set-Content (Join-Path $dir 'last-files.txt') }
+          }
+
+          function Open-LastFiles {
+            $f = Join-Path $env:GITHUB_WORKSPACE '.vps-settings\last-files.txt'
+            if (-not (Test-Path $f)) { return }
+            $paths = @(Get-Content $f | ForEach-Object { Join-Path $env:GITHUB_WORKSPACE $_ } | Where-Object { Test-Path -LiteralPath $_ })
+            if ($paths.Count -eq 0) { return }
+            $editor = @('C:\Program Files\Microsoft VS Code\Code.exe', 'C:\Program Files\Notepad++\notepad++.exe') | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if (-not $editor) { $editor = 'notepad.exe' }
+            $quoted = ($paths | ForEach-Object { '"' + $_ + '"' }) -join ' '
+            $code = "Start-Process -FilePath '" + $editor.Replace("'", "''") + "' -ArgumentList '" + $quoted.Replace("'", "''") + "'"
+            Invoke-InSession $code
+            Send-TG "📂 فتحت لك آخر الملفات لي كنت تخدم عليها."
+          }
+
+          function Send-Backup($caption, $force) {
+            $ws = $env:GITHUB_WORKSPACE
+            $items = @(Get-ChildItem -LiteralPath $ws -Force | Where-Object { $_.Name -ne '.git' })
+            if ($items.Count -eq 0) { if ($force) { Send-TG "📦 MY WORK خاوي." }; return }
+            $newest = (Get-ChildItem -LiteralPath $ws -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notlike '*\.git\*' } | Measure-Object LastWriteTime -Maximum).Maximum
+            if (-not $force -and $global:LastBackup -and $newest -le $global:LastBackup) { return }
+            $zip = "C:\Users\Public\backup-$(Get-Date -Format 'yyyyMMdd-HHmm').zip"
+            try { Compress-Archive -LiteralPath $items.FullName -DestinationPath $zip -Force -ErrorAction Stop }
+            catch { Send-TG "❌ فشل إنشاء النسخة الاحتياطية"; return }
+            [void](Send-TGFile $zip $caption)
+            $global:LastBackup = Get-Date
+            Remove-Item $zip -Force -ErrorAction SilentlyContinue
+          }
+
+          function Send-FilesCmd($arg) {
+            $ws = $env:GITHUB_WORKSPACE
+            if (-not $arg) {
+              $items = @(Get-ChildItem -LiteralPath $ws -Force | Where-Object { $_.Name -ne '.git' } | Select-Object -First 40)
+              if ($items.Count -eq 0) { Send-TG "📂 المجلد خاوي."; return }
+              $lines = $items | ForEach-Object { if ($_.PSIsContainer) { "📁 $($_.Name)" } else { "📄 $($_.Name) ($([math]::Round($_.Length / 1KB)) KB)" } }
+              Send-TG ("📂 محتوى MY WORK:`n" + ($lines -join "`n") + "`n`nاكتب /files اسم_الملف باش نبعثو.")
+              return
+            }
+            $p = if ([IO.Path]::IsPathRooted($arg)) { $arg } else { Join-Path $ws $arg }
+            if (-not (Test-Path -LiteralPath $p)) { Send-TG "❌ ما لقيتش: $arg"; return }
+            $it = Get-Item -LiteralPath $p
+            if ($it.PSIsContainer) {
+              $zip = "C:\Users\Public\$($it.Name).zip"
+              Compress-Archive -LiteralPath $it.FullName -DestinationPath $zip -Force
+              [void](Send-TGFile $zip "📁 $($it.Name)")
+              Remove-Item $zip -Force -ErrorAction SilentlyContinue
+            } else {
+              [void](Send-TGFile $it.FullName "📄 $($it.Name)")
+            }
+          }
+
+          function Send-Screenshot {
+            if (-not (Get-Rdp)) { Send-TG "📸 ما كاينش حد متصل بـ RDP، ما نقدرش ناخذ صورة."; return }
+            $png = 'C:\Users\Public\shot.png'
+            Remove-Item $png -Force -ErrorAction SilentlyContinue
+            $lines = @(
+              'Add-Type -AssemblyName System.Windows.Forms,System.Drawing',
+              '$b = [System.Windows.Forms.SystemInformation]::VirtualScreen',
+              '$bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height',
+              '$g = [System.Drawing.Graphics]::FromImage($bmp)',
+              '$g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)',
+              '$bmp.Save("C:\Users\Public\shot.png")'
+            )
+            Invoke-InSession ($lines -join "`n")
+            for ($i = 0; $i -lt 20 -and -not (Test-Path $png); $i++) { Start-Sleep -Seconds 1 }
+            if (Test-Path $png) {
+              Start-Sleep -Seconds 1
+              Send-TGPhoto $png "📸 $(Get-Date -Format 'HH:mm')"
+              Remove-Item $png -Force -ErrorAction SilentlyContinue
+            } else { Send-TG "❌ ما قدرتش ناخذ الصورة." }
+          }
+
+          function Install-Apps($arg) {
+            $names = @($arg -split '\s+' | Where-Object { $_ -match '^[A-Za-z0-9][A-Za-z0-9._-]*$' })
+            if ($names.Count -eq 0) { Send-TG "❌ اكتب اسم صحيح، مثال: /install vlc"; return }
+            foreach ($n in $names) {
+              Send-TG "⏳ نثبّت $n ..."
+              $out = choco install $n -y --no-progress 2>&1 | Out-String
+              if (@(0, 1641, 3010) -contains $LASTEXITCODE) { Send-TG "✅ تثبّت $n" }
+              else { Send-TG ("❌ فشل تثبيت $n`n" + (($out -split "`n" | Select-Object -Last 6) -join "`n")) }
+            }
+            Save-Work "apps-update"
+          }
+
+          function Save-Work($label) {
+            Set-Location $env:GITHUB_WORKSPACE
+            Backup-Settings ($label -ne 'auto-save')
+            Update-LastFiles
+
+            # fichiers > 90MB : exclus (limite GitHub = 100MB)
+            Get-ChildItem -Recurse -File -Force -ErrorAction SilentlyContinue |
+              Where-Object { $_.Length -gt 90MB -and $_.FullName -notlike '*\.git\*' } |
+              ForEach-Object {
+                $rel = $_.FullName.Substring($env:GITHUB_WORKSPACE.Length + 1).Replace('\', '/')
+                if (-not (Select-String -Path ".git/info/exclude" -Pattern ([regex]::Escape($rel)) -Quiet -ErrorAction SilentlyContinue)) {
+                  Add-Content ".git/info/exclude" $rel
+                  Send-TG "⚠️ ملف كبير ما تم رفعوش (أكبر من 90MB): $rel`nتنجم تبعثو بـ /files"
+                }
+              }
+
+            # applications installées via choco depuis le début de la session
+            if (Test-Path "C:\base-apps.txt") {
+              $base = Get-Content "C:\base-apps.txt"
+              $now = Get-ChildItem "C:\ProgramData\chocolatey\lib" -Directory | ForEach-Object { $_.Name }
+              $new = $now | Where-Object { $_ -notin $base }
+              if ($new) {
+                $old = if (Test-Path "extra-apps.txt") { @(Get-Content "extra-apps.txt") } else { @() }
+                $added = @($new | Where-Object { $_ -notin $old })
+                if ($added.Count -gt 0) {
+                  ($old + $added | Where-Object { $_ } | Sort-Object -Unique) | Set-Content "extra-apps.txt"
+                  foreach ($a in $added) { Add-Stat 'app' $a }
+                  Send-TG "📦 تطبيقات جديدة تحفظت: $($added -join ', ')"
+                }
+              }
+            }
+
+            git add -A
+            git diff --cached --quiet
+            if ($LASTEXITCODE -ne 0) {
+              $n = (git diff --cached --name-only | Measure-Object).Count
+              git commit -m "$label $(Get-Date -Format s)" 2>&1 | Out-Null
+              $pullOut = git pull --rebase 2>&1 | Out-String
+              if ($LASTEXITCODE -ne 0) {
+                git rebase --abort 2>&1 | Out-Null
+                Send-TG ("⚠️ تعارض عند جلب التغييرات من GitHub، الحفظ تأجّل:`n" + (($pullOut.Trim() -split "`n" | Select-Object -Last 3) -join "`n"))
+                return
+              }
+              $pushOut = git push 2>&1 | Out-String
+              if ($LASTEXITCODE -eq 0) { Add-Stat 'saved' $n; Send-TG "💾 تم الحفظ: $n ملف/ملفات" }
+              else { Send-TG ("❌ فشل الرفع إلى GitHub:`n" + (($pushOut.Trim() -split "`n" | Select-Object -Last 3) -join "`n")) }
+            }
+          }
+
+          function Send-Report {
+            $st = [datetime]::Parse($env:START_TIME, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+            $up = [int]((Get-Date).ToUniversalTime() - $st).TotalMinutes
+            $rows = if (Test-Path "C:\stats.txt") { @(Get-Content "C:\stats.txt") } else { @() }
+            $saves = $rows | Where-Object { $_ -like 'saved,*' } | ForEach-Object { [int](($_ -split ',')[1]) } | Measure-Object -Sum
+            $apps = @($rows | Where-Object { $_ -like 'app,*' } | ForEach-Object { ($_ -split ',')[1] })
+            $rdp = @($rows | Where-Object { $_ -like 'rdp,*' }).Count
+            $appsTxt = if ($apps.Count -gt 0) { $apps -join ', ' } else { 'لا شيء' }
+            Send-TG "📋 تقرير الجلسة`n⏱️ المدة: $up دقيقة`n💾 الحفظ: $($saves.Count) مرات ($([int]$saves.Sum) ملف)`n📦 تطبيقات جديدة: $appsTxt`n🔌 دخول RDP: $rdp مرات"
+          }
+          '@ | Set-Content -Path "C:\tg.ps1" -Encoding utf8
+
+      - name: Write secret helper
+        shell: pwsh
+        run: |
+          @'
+          import base64, json, os, sys, urllib.request
+          try:
+              from nacl import encoding, public
+              repo = os.environ["GITHUB_REPOSITORY"]
+              pat = os.environ["GH_PAT"]
+              name = sys.argv[1]
+              value = sys.stdin.read().strip()
+
+              def gh(method, path, body=None):
+                  req = urllib.request.Request(
+                      "https://api.github.com" + path,
+                      data=json.dumps(body).encode() if body is not None else None,
+                      method=method,
+                      headers={"Authorization": "Bearer " + pat, "Accept": "application/vnd.github+json"},
+                  )
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      txt = r.read().decode()
+                      return json.loads(txt) if txt else {}
+
+              pk = gh("GET", "/repos/" + repo + "/actions/secrets/public-key")
+              key = public.PublicKey(pk["key"].encode(), encoding.Base64Encoder())
+              sealed = public.SealedBox(key).encrypt(value.encode())
+              gh("PUT", "/repos/" + repo + "/actions/secrets/" + name,
+                 {"encrypted_value": base64.b64encode(sealed).decode(), "key_id": pk["key_id"]})
+              print("ok")
+          except Exception as e:
+              print("error:", type(e).__name__, getattr(e, "code", ""))
+          '@ | Set-Content -Path "C:\setsecret.py" -Encoding utf8
+
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          New-NetFirewallRule -DisplayName "RDP-3389" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any -ErrorAction SilentlyContinue
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP user
+        shell: pwsh
+        run: |
+          $chars = (48..57) + (65..90) + (97..122)
+          $password = (-join ((1..16 | ForEach-Object { [char]($chars | Get-Random) }))) + "!aA1"
+          Write-Host "::add-mask::$password"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -PasswordNeverExpires | Out-Null
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          "RDP_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: choco install tailscale -y --no-progress
+
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          . C:\tg.ps1
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          Start-Sleep -Seconds 10
+          $out = & $ts up "--authkey=$($env:TS_KEY)" "--hostname=gh-runner-${{ github.run_id }}" --unattended 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) {
+            if ($env:TS_KEY) { $out = $out.Replace($env:TS_KEY, '***') }
+            $short = ($out.Trim() -split "`n" | Select-Object -Last 5) -join "`n"
+            Send-TG "❌ فشل الاتصال بـ Tailscale`n$short`n`nإذا المفتاح منتهي أو غير صالح: ابعت للبوت تاع التحكم: /setkey tskey-... ثم /startvps"
+            Write-Error "tailscale up failed"
+            exit 1
+          }
+          $ip = $null
+          for ($i = 0; $i -lt 12 -and -not $ip; $i++) {
+            $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+            if (-not $ip) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $ip) {
+            Send-TG "❌ Tailscale اتصل لكن ما عطاش IP"
+            Write-Error "Tailscale IP not assigned"
+            exit 1
+          }
+          "TS_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Send access info
+        shell: pwsh
+        run: |
+          . C:\tg.ps1
+          $round = ([int]$env:RESTART_COUNT) + 1
+          Send-TG ("✅ السيرفر واجد (تشغيل رقم $round)`n" + (Get-Info) + "`n(ماتنساش تفتح Tailscale على جهازك)`n`n⏳ نثبّت التطبيقات، والأوامر تبدأ تخدم بعد ما تخلص. اكتب /help`n😴 إذا ما دخلتش RDP في 90 دقيقة نسكّر السيرفر (تنجم توقفها بـ /idle off)")
+          Write-Host "Access info sent to Telegram"
+
+      - name: Install apps
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          . C:\tg.ps1
+          $apps = @("googlechrome","firefox","r.project","rstudio","vscode","git","7zip","python","notepadplusplus","vlc","googledrive","brave","dev-cpp","adobereader","wps-office-free","telegram","whatsapp","microsoft-windows-terminal")
+          $failed = @()
+          foreach ($app in $apps) {
+            Write-Host "=== Installing $app ==="
+            choco install $app -y --no-progress
+            if ($LASTEXITCODE -ne 0) { $failed += $app }
+          }
+          if ($failed.Count -gt 0) { Write-Host "FAILED: $($failed -join ', ')"; Send-TG "⚠️ تطبيقات ما تثبّتوش: $($failed -join ', ')" } else { Write-Host "All apps installed" }
+          exit 0
+
+      - name: Restore extra apps
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          . C:\tg.ps1
+          if (Test-Path "extra-apps.txt") {
+            $list = Get-Content "extra-apps.txt" | Where-Object { $_ }
+            foreach ($app in $list) {
+              Write-Host "=== Restoring $app ==="
+              choco install $app -y --no-progress
+            }
+            Send-TG "📦 تم تثبيت التطبيقات المضافة سابقا: $($list -join ', ')"
+          }
+          # baseline : tout ce qui est installé à ce stade
+          Get-ChildItem "C:\ProgramData\chocolatey\lib" -Directory | ForEach-Object { $_.Name } | Set-Content "C:\base-apps.txt"
+          Send-TG "🔄 التحديثات والتثبيتات سالات. السيرفر جاهز. اكتب /help"
+          exit 0
+
+      - name: Desktop shortcut
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $shell = New-Object -ComObject WScript.Shell
+          $lnk = $shell.CreateShortcut("C:\Users\Public\Desktop\MY WORK.lnk")
+          $lnk.TargetPath = "${{ github.workspace }}"
+          $lnk.Save()
+
+      - name: Web shortcuts
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $shell = New-Object -ComObject WScript.Shell
+          $sites = @{
+            "Google Meet" = "https://meet.google.com"
+            "Gemini"      = "https://gemini.google.com"
+            "ChatGPT"     = "https://chatgpt.com"
+            "Claude"      = "https://claude.ai"
+          }
+          foreach ($name in $sites.Keys) {
+            $lnk = $shell.CreateShortcut("C:\Users\Public\Desktop\$name.url")
+            $lnk.TargetPath = $sites[$name]
+            $lnk.Save()
+          }
+
+      - name: Git config
+        shell: pwsh
+        run: |
+          git config user.name "vps-bot"
+          git config user.email "vps-bot@users.noreply.github.com"
+
+      - name: Keep alive, auto-save and Telegram bot
+        shell: pwsh
+        run: |
+          . C:\tg.ps1
+
+          $count = [int]$env:RESTART_COUNT
+          $maxRestarts = [int]$env:MAX_RESTARTS
+
+          # ignorer les commandes envoyées avant le démarrage de ce serveur
+          $offset = 0
+          $startDt = [datetime]::Parse($env:START_TIME, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+          $startEpoch = ([DateTimeOffset]$startDt).ToUnixTimeSeconds()
+
+          $lastSave = Get-Date
+          $lastStatus = Get-Date
+          $lastBackupTime = Get-Date
+          $lastPass = Get-Date
+          $lastRdp = Get-Date
+          $warned = @{}
+          $autoRestart = $true
+          $restarted = $false
+          $polling = $true
+          $stopAt = $null
+          $idleLimit = 90
+          $idleWarned = $false
+          $passEveryMin = 0
+          $rdpWas = $false
+          $tsWas = $true
+          $ramAlert = $false
+          $diskAlert = $false
+          $settingsRestored = $false
+          $watch = @('Rscript', 'Rterm', 'python', 'rsession')
+          $procUp = @{}
+          $tick = 0
+          $offNow = $false
+
+          Send-TG "🟢 البوت يسمع الأوامر دابا. اكتب /help"
+
+          while ((Get-LeftMin) -gt 0) {
+            Start-Sleep -Seconds 20
+            $tick++
+            try {
+
+            if ($stopAt -and (Get-Date) -ge $stopAt) {
+              Save-Work "final-before-stop"
+              Send-TG "🛑 هذا السيرفر يتسكر دابا. خدّم السيرفر الجديد."
+              break
+            }
+
+            # ---------- commandes Telegram ----------
+            if ($polling) {
+              try {
+                $r = Invoke-RestMethod -Uri "https://api.telegram.org/bot$($env:TG_BOT_TOKEN)/getUpdates?offset=$offset&timeout=0&allowed_updates=%5B%22message%22%2C%22callback_query%22%5D"
+                foreach ($u in $r.result) {
+                  $offset = $u.update_id + 1
+                  if ($u.callback_query) {
+                    $cq = $u.callback_query
+                    if ("$($cq.message.chat.id)" -ne "$env:TG_CHAT_ID") { continue }
+                    Answer-Callback $cq.id
+                    if (@('status', 'speed', 'save', 'screenshot', 'time', 'info', 'menu') -notcontains "$($cq.data)") { continue }
+                    $cmd = '/' + "$($cq.data)"
+                    $arg = ''
+                  } else {
+                    if ($u.message.date -lt $startEpoch) { continue }
+                    if ("$($u.message.chat.id)" -ne "$env:TG_CHAT_ID") { continue }
+                    $text = "$($u.message.text)".Trim()
+                    if (-not $text.StartsWith('/')) { continue }
+                    $parts = $text -split '\s+', 2
+                    $cmd = ($parts[0] -split '@')[0].ToLower()
+                    $arg = if ($parts.Count -gt 1) { $parts[1].Trim() } else { '' }
+                  }
+                  try {
+                    switch ($cmd) {
+                      '/help'       { Send-TG $helpText }
+                      '/info'       { Send-TG (Get-Info) }
+                      '/status'     { Send-TGButtons (Get-Status) @("⚡ قياس السرعة;speed|🔄 تحديث;status") }
+                      '/speed'      { Send-TG "⏳ نقيس السرعة، ياخذ حوالي 20 ثانية..."; Send-Speed }
+                      '/ping'       { Send-TG "⏳ نقيس السرعة، ياخذ حوالي 20 ثانية..."; Send-Speed }
+                      '/menu'       { Send-TGButtons "🎛️ لوحة التحكم" @("📊 الحالة;status|⚡ قياس السرعة;speed", "💾 حفظ الآن;save|📸 صورة الشاشة;screenshot", "ℹ️ معلومات الدخول;info|⏳ الوقت;time") }
+                      '/time'       { Send-TG "⏳ باقي $(Get-LeftMin) دقيقة" }
+                      '/errors'     {
+                        if ($global:ErrLog.Count -eq 0) { Send-TG "✅ ما كاين حتى خطأ مسجّل." }
+                        else { Send-TG ("📋 آخر الأخطاء:`n" + ($global:ErrLog -join "`n")) }
+                      }
+                      '/save'       { Save-Work "manual-save" }
+                      '/backup'     { Send-Backup "📦 نسخة احتياطية يدوية" $true }
+                      '/files'      { Send-FilesCmd $arg }
+                      '/screenshot' { Send-Screenshot }
+                      '/setkey' {
+                        try { Invoke-RestMethod -Uri "https://api.telegram.org/bot$($env:TG_BOT_TOKEN)/deleteMessage" -Method Post -Body @{ chat_id = $env:TG_CHAT_ID; message_id = $u.message.message_id } | Out-Null } catch { }
+                        if (-not $env:GH_PAT) { Send-TG "❌ السر GH_PAT ناقص في GitHub." }
+                        elseif ($arg -notmatch '^tskey-[A-Za-z0-9_-]{10,200}$') { Send-TG "❌ المفتاح غير صالح. الشكل: /setkey tskey-auth-xxxx" }
+                        else {
+                          python -m pip install --quiet pynacl 2>&1 | Out-Null
+                          $o = ($arg | python C:\setsecret.py TAILSCALE_AUTH_KEY 2>&1 | Out-String).Trim().Replace($arg, '***')
+                          if ($o -eq 'ok') { Send-TG "✅ تم حفظ TAILSCALE_AUTH_KEY (ومسحت رسالتك). السيرفرات الجاية تستعملو." }
+                          else { Send-TG "❌ فشل حفظ المفتاح: $o`nتأكد أن GH_PAT فيه صلاحية Secrets: Read and write." }
+                        }
+                      }
+                      '/install'    { Install-Apps $arg }
+                      '/run' {
+                        if (-not $arg) { Send-TG "اكتب الأمر بعد /run، مثال: /run Get-Date" }
+                        else {
+                          $res = Invoke-Timed { param($c) Set-Location $env:GITHUB_WORKSPACE; Invoke-Expression $c 2>&1 | Out-String } @($arg) 90
+                          $res = ($res | Out-String).Trim()
+                          if (-not $res) { $res = "(ما كاين حتى نتيجة)" }
+                          Send-TG "💻 $res"
+                        }
+                      }
+                      '/newpass' {
+                        if ($arg -match '^auto\s+(\d+)$') {
+                          $hours = [int]$Matches[1]
+                          $passEveryMin = $hours * 60
+                          $lastPass = Get-Date
+                          Send-TG "🔑 كلمة السر تتبدّل تلقائيا كل $hours ساعات."
+                        }
+                        elseif ($arg -match '^auto\s+off$') { $passEveryMin = 0; Send-TG "🔑 التغيير التلقائي توقف." }
+                        else {
+                          $np = New-RdpPassword
+                          $lastPass = Get-Date
+                          Send-TG "🔑 كلمة سر جديدة:`nUser: RDP`nPass: $np"
+                        }
+                      }
+                      '/idle' {
+                        if ($arg -eq 'off') { $idleLimit = 0; Send-TG "😴 الإغلاق عند عدم الاتصال: متوقف." }
+                        elseif ($arg -eq 'on') { $idleLimit = 90; $lastRdp = Get-Date; $idleWarned = $false; Send-TG "😴 نسكّر السيرفر إذا ما كاينش اتصال RDP لمدة 90 دقيقة." }
+                        elseif ($arg -match '^\d+$' -and [int]$arg -ge 15) { $idleLimit = [int]$arg; $lastRdp = Get-Date; $idleWarned = $false; Send-TG "😴 نسكّر السيرفر إذا ما كاينش اتصال RDP لمدة $idleLimit دقيقة." }
+                        else { Send-TG "الاستعمال: /idle off أو /idle on أو /idle 120 (دقايق، 15 على الأقل)" }
+                      }
+                      '/watch' {
+                        if ($arg) {
+                          $wn = ($arg -replace '\.exe$', '').Trim()
+                          if ($watch -notcontains $wn) { $watch += $wn }
+                        }
+                        Send-TG "👀 نراقب: $($watch -join ', ')`nزيد: /watch اسم_البرنامج"
+                      }
+                      '/unwatch' {
+                        $wn = ($arg -replace '\.exe$', '').Trim()
+                        $watch = @($watch | Where-Object { $_ -ne $wn })
+                        $procUp.Remove($wn)
+                        Send-TG "👀 نراقب: $($watch -join ', ')"
+                      }
+                      '/stop' {
+                        $autoRestart = $false
+                        Send-TG "⏹️ التشغيل التلقائي توقف. السيرفر ما يعاودش يتشغل بعد ما يخلص الوقت."
+                      }
+                      '/restart' {
+                        Save-Work "pre-restart-save"
+                        $restarted = $true
+                        if (Start-NewRun 0) {
+                          $polling = $false
+                          $stopAt = (Get-Date).AddMinutes(15)
+                          Send-TG "🔁 تم تشغيل سيرفر جديد. تجيك رسالة بمعلومات الدخول الجديدة بعد حوالي 10 دقايق. هذا السيرفر يتسكر بعد 15 دقيقة، والأوامر تخدم من الجديد."
+                        }
+                      }
+                      '/off' {
+                        $autoRestart = $false
+                        Save-Work "manual-off"
+                        Send-TG "🛑 نسكّر هذا السيرفر دابا."
+                        $offNow = $true
+                      }
+                    }
+                  } catch { Report-Error "الأمر $cmd" $_ }
+                }
+              } catch { Report-Error 'قراءة أوامر تلجرام' $_ }
+              if ($offNow) { break }
+            }
+
+            # ---------- RDP ----------
+            $rdpNow = Get-Rdp
+            if ($rdpNow) { $lastRdp = Get-Date; $idleWarned = $false }
+            if ($rdpNow -and -not $rdpWas) { Send-TG "🟢 واحد دخل لـ RDP"; Add-Stat 'rdp' 1 }
+            if (-not $rdpNow -and $rdpWas) { Send-TG "🔴 خرج من RDP" }
+            $rdpWas = $rdpNow
+
+            # restauration des réglages + ouverture des derniers fichiers (une seule fois)
+            if (-not $settingsRestored -and $rdpNow -and (Test-Path 'C:\Users\RDP\AppData')) {
+              $settingsRestored = $true
+              Restore-Settings
+              Open-LastFiles
+            }
+
+            # ---------- Tailscale ----------
+            $tsNow = [bool](& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null | Select-Object -First 1)
+            if (-not $tsNow -and $tsWas) { Send-TG "⚠️ Tailscale تقطع! ما تقدرش تدخل للسيرفر." }
+            if ($tsNow -and -not $tsWas) { Send-TG "✅ Tailscale رجع." }
+            $tsWas = $tsNow
+
+            # ---------- RAM / disque / programmes surveillés (chaque ~1 min) ----------
+            if ($tick % 3 -eq 0) {
+              $os = Get-CimInstance Win32_OperatingSystem
+              $ram = [int](100 * (1 - $os.FreePhysicalMemory / $os.TotalVisibleMemorySize))
+              $dsk = Get-PSDrive C
+              $disk = [int](100 * $dsk.Used / ($dsk.Used + $dsk.Free))
+              if ($ram -ge 90 -and -not $ramAlert) { $ramAlert = $true; Send-TG "⚠️ RAM وصلت $ram%" }
+              if ($ram -lt 80) { $ramAlert = $false }
+              if ($disk -ge 90 -and -not $diskAlert) { $diskAlert = $true; Send-TG "⚠️ القرص C وصل $disk%" }
+              if ($disk -lt 80) { $diskAlert = $false }
+
+              foreach ($wn in $watch) {
+                $up = [bool](Get-Process -Name $wn -ErrorAction SilentlyContinue)
+                if ($procUp.ContainsKey($wn) -and $procUp[$wn] -and -not $up) { Send-TG "🛑 البرنامج وقف أو كمّل: $wn" }
+                $procUp[$wn] = $up
+              }
+            }
+
+            # ---------- sauvegarde auto toutes les 5 minutes ----------
+            if (((Get-Date) - $lastSave).TotalMinutes -ge 5) {
+              Save-Work "auto-save"
+              $lastSave = Get-Date
+            }
+
+            # ---------- rapport d'état toutes les 30 minutes ----------
+            if (((Get-Date) - $lastStatus).TotalMinutes -ge 30) {
+              Send-TG (Get-Status)
+              $lastStatus = Get-Date
+            }
+
+            # ---------- copie zip dans Telegram chaque heure (si changement) ----------
+            if (((Get-Date) - $lastBackupTime).TotalMinutes -ge 60) {
+              Send-Backup "📦 نسخة احتياطية (كل ساعة)" $false
+              $lastBackupTime = Get-Date
+            }
+
+            # ---------- changement automatique du mot de passe ----------
+            if ($passEveryMin -gt 0 -and ((Get-Date) - $lastPass).TotalMinutes -ge $passEveryMin) {
+              $np = New-RdpPassword
+              $lastPass = Get-Date
+              Send-TG "🔑 كلمة السر تبدّلت تلقائيا:`nUser: RDP`nPass: $np"
+            }
+
+            # ---------- arrêt si personne n'est connecté ----------
+            if ($idleLimit -gt 0) {
+              $idle = ((Get-Date) - $lastRdp).TotalMinutes
+              if ($idle -ge $idleLimit) {
+                $autoRestart = $false
+                Save-Work "idle-stop"
+                Send-TG "😴 ما كانش حد متصل $([int]$idle) دقيقة. حفظت الملفات وسكّرت السيرفر باش ما نضيّعش الدقايق. اكتب /restart باش تشغّل جديد."
+                break
+              }
+              elseif ($idle -ge ($idleLimit - 10) -and -not $idleWarned) {
+                $idleWarned = $true
+                Send-TG "⏳ ما كاينش حد متصل. بعد 10 دقايق نسكّر السيرفر. ادخل بـ RDP ولا اكتب /idle off"
+              }
+            }
+
+            # ---------- alertes avant la fin ----------
+            $left = Get-LeftMin
+            foreach ($m in 30, 10, 5) {
+              if ($left -le $m -and -not $warned[$m]) {
+                $warned[$m] = $true
+                Send-TG "⏰ باقي تقريبا $m دقيقة ويتسكر السيرفر. حفظ الملفات رايح يتدار تلقائيا."
+              }
+            }
+
+            # ---------- redémarrage automatique ----------
+            if ($autoRestart -and -not $restarted -and $left -le 15) {
+              $restarted = $true
+              Save-Work "pre-restart-save"
+              if ($count -lt $maxRestarts) {
+                if (Start-NewRun ($count + 1)) {
+                  $polling = $false
+                  Send-TG "🔁 تم تشغيل سيرفر جديد تلقائيا (رقم $($count + 2) من $($maxRestarts + 1)). يوجد بعد حوالي 10 دقايق وتجيك رسالة بمعلومات الدخول الجديدة. هذا السيرفر يبقى خدّام حوالي 15 دقيقة، والأوامر تخدم من الجديد."
+                }
+              } else {
+                Send-TG "⛔ وصلنا الحد الأقصى للتشغيل التلقائي ($($maxRestarts + 1) مرات). ما نعاودش نشغّل. اكتب /restart باش تشغّل يدويا."
+              }
+            }
+            } catch { Report-Error 'الحلقة الرئيسية' $_ }
+          }
+
+      - name: Report failure
+        if: failure()
+        shell: pwsh
+        run: |
+          if (Test-Path C:\tg.ps1) { . C:\tg.ps1 }
+          else {
+            function Send-TG($t) {
+              try { Invoke-RestMethod -Uri "https://api.telegram.org/bot$($env:TG_BOT_TOKEN)/sendMessage" -Method Post -Body @{ chat_id = $env:TG_CHAT_ID; text = $t } | Out-Null } catch { }
+            }
+          }
+          $url = "https://github.com/$($env:GITHUB_REPOSITORY)/actions/runs/$($env:GITHUB_RUN_ID)"
+          try {
+            $h = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+            $base = "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)"
+            $jobs = Invoke-RestMethod -Uri "$base/actions/runs/$($env:GITHUB_RUN_ID)/jobs" -Headers $h
+            $job = $jobs.jobs | Select-Object -First 1
+            $failed = @($job.steps | Where-Object { $_.conclusion -eq 'failure' } | ForEach-Object { $_.name })
+            $ann = @()
+            try {
+              $ann = @(Invoke-RestMethod -Uri "$base/check-runs/$($job.id)/annotations" -Headers $h |
+                Where-Object { $_.annotation_level -eq 'failure' } | ForEach-Object { $_.message })
+            } catch { }
+            $txt = "❌ صرا خطأ في التشغيل`nالخطوة لي فشلت: $($failed -join ', ')"
+            if ($ann.Count -gt 0) { $txt += "`n" + (($ann | Select-Object -Unique -First 5) -join "`n") }
+            Send-TG "$txt`n$url"
+          } catch {
+            Send-TG "❌ صرا خطأ في التشغيل. شوف التفاصيل:`n$url"
+          }
+
+      - name: Final save
+        if: always()
+        shell: pwsh
+        run: |
+          . C:\tg.ps1
+          Save-Work "final-save"
+          Send-Report
+          Send-TG "🛑 هذا السيرفر تسكر. آخر حفظ تدار."
